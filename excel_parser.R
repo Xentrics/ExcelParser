@@ -9,10 +9,15 @@
 #== Try to load packages. Install if not present ====
 # Help output string if something goes wrong
 CMDstring <- "
-    Rscript excel_parser.R <Ausgabe.xlsx> <Ausgabe.xlsx> [--add_prices]
+    Rscript excel_parser.R <Eingabe.xlsx> <Ausgabe> [--add_prices]
     
-      --add_prices Ist optional.
+      <Eingabe.xlsx> Pfad zu einer '.xls' oder '.xlsx' Datei.
+      <Ausgabe>      Präfix zur Ausgabe von Dateien. Für jede valide Seite in der
+                     Eingabedatei wird eine separate Ausgabedatei angelegt.
+      --add_prices   Ist optional. Wenn angegeben, werden Einzelverkaufspreise
+                     mit ausgegeben.
 "
+
 
 
 #' Loads a package. Installs it if necessary.
@@ -37,11 +42,11 @@ try_load_package("dplyr")
 try_load_package("tidyr")
 try_load_package("magrittr")
 try_load_package("stringr")
-try_load_package("tidyxl")
 try_load_package("readxl")
-try_load_package("writexl")
+#try_load_package("tidyxl") # only required of formats shall be parsed
 
 message(print("  >> Script erfolgreich geladen."))
+
 
 
 
@@ -49,12 +54,12 @@ message(print("  >> Script erfolgreich geladen."))
 args = commandArgs(trailingOnly=TRUE)
 
 # FOR TESTING ONLY
-args <- c("210-07088-3-MH_Seume__Burstmaschine_220217.xlsx", "steph_text", "add_prices")
+args <- c("Kontrolle_210-07977-AG_JAB-Hebeanlage_171219.xlsx", "steph_text", "add_prices")
 
 
 # Positional Arguments
 if ( length(args) < 2 ) {
-  stop("Es mÃ¼ssen Eingabe- und Ausgabe-Dateien angegeben werden.\n", CMDstring, call. = F)
+  stop("Es müssen Eingabe- und Ausgabe-Dateien angegeben werden.\n", CMDstring, call. = F)
 }
 
 
@@ -75,146 +80,74 @@ output_pref <- args[2]
 if (!file.exists(input_file))
   stop(sprintf("Eingabedatei nicht gefunden: '%s'", input_file))
 
-if ( output_file == "" || grepl("^\\.", output_file) )
-  stop("Name fÃ¼r Ausgabedatei ungÃ¼ltig. Der Dateiname sollte nicht mit einem '.' beginnen und nicht leer sein. Dateiname: '", output_file, "'")
+if ( output_pref == "" || grepl("^\\.", output_pref) )
+  stop("Name für Ausgabedatei ungültig. Der Dateiname sollte nicht mit einem '.' beginnen und nicht leer sein. Dateiname: '", output_file, "'")
 
-dir.create(dirname(output_file), recursive = T, showWarnings = F)
+dir.create(dirname(output_pref), recursive = T, showWarnings = F)
 
 message(sprintf("  >> Eingabedatei: '%s'", input_file))
-message(sprintf("  >> AusgabeprÃ¤fix: '%s'", output_pref))
+message(sprintf("  >> Ausgabepräfix: '%s'", output_pref))
 
 
 
 #== Parse Excel Files  ====
 # Tasks
-# - bold items make a new "main entry"
-# - entries under "Nr." marke a new sub-entry
-#   - Encoding: main_entry sub[n] sub[n-1] ...
+# - Main entries do not have numbers, or fabricants
 # - remove items with 0 abundance
+# - if type is missing, do not output it
 # - some pages are irrelevant for the units. detect & ignore them
 # - add prices optional
 # - parse each sheet into separat text outputs
 
-
-### Pt1. Determine Bold Cells
-
-# Load Excel File
-exdat <- tidyxl::xlsx_cells(input_file)
-# Note: tidyxl fails to parse german letters correctly...
-#   So we fix that here by loading the sheet names with 'readxl'
-exdat %<>% mutate(sheet = factor(sheet,
-                                 levels = tidyxl::xlsx_sheet_names(input_file),
-                                 labels = readxl::excel_sheets(input_file)) %>%
-                    as.character())
-
-# get cell indices at which bold names are used
-formats <- xlsx_formats(input_file)
-bold_cells <- exdat[exdat$local_format_id %in% which(formats$local$font$bold), c("sheet", "address", "character")]
-bold_cells %<>% mutate(is_bold = TRUE)
-exdat %<>%
-  left_join(bold_cells) %>%
-  mutate(is_bold = ifelse(data_type == "blank", F, is_bold)) %>%
-  select(sheet, address, data_type, character, style_format, is_bold)
-
-# give is more informative names
-exdat %<>% dplyr::rename(main_unit = is_bold)
-
-
-## translate address to actual indices
-# split address into x & y
-exdat %<>% 
-  mutate(coladd = str_extract(address, "^[A-Z]+"),
-         rowadd = str_extract(address, "\\d+$") %>% as.integer())
-
-# make proper index mapping
-colorder <- tibble(cols = unique(exdat$coladd)) %>%
-  mutate(collen = nchar(cols)) %>%
-  arrange(collen, cols)
-
-# translate letters into coordinate
-exdat %<>% mutate(coladd = factor(coladd, levels = colorder[["cols"]]) %>% as.integer())
-
-## remove everything that is not relevant to find the sections
-# only bold text in column 2 (Bezeichnung) are relevant
-exdat %<>% 
-  filter(main_unit & coladd == 2)
-
-
-
-
-### Pt2. Parse content & format output
-# Strategy:
-#   - we now the main unit entries & their indices
-#   - hence, jump from entry to entry, remove NA blocks at a time, etc.
 sheets <- readxl::excel_sheets(input_file)
 
 # iterate all sheets
 for (sheet in sheets) {
 
   datadf <- suppressWarnings(readxl::read_excel(input_file, sheet = sheet))
+  
   # check if these are actual pricing sheets
   if (!("Bezeichnung" %in% colnames(datadf)))
     next()
   
+  # clean data
   datadf %<>%
-    select(`Nr.`, Bezeichnung, Typ, Hersteller, Anzahl, `VK\r\nEP`)
-  unitinfo <- exdat %>% filter(sheet == !!sheet)
-  rowindices <- c(unitinfo$rowadd - 1, nrow(datadf)) # first index to start, last index to end
+    select(Bezeichnung, Typ, Hersteller, Anzahl, contains("EP")) %>%
+    #drop_na(Bezeichnung) %>%
+    filter(is.na(Anzahl) | Anzahl > 0) %>%
+    mutate(Titel = NA)
+  
+  # remove trailing NA
+  last_valid <- datadf$Bezeichnung %>% is.na %>% not %>% which %>% last
+  datadf <- datadf[1:last_valid,]
+  
+  # find Einzelpreis column (in case it is needed)
+  ep_col <- which(grepl("EP", colnames(datadf)))
   
   
   output_lines <- list()
-  
-  
-  # Iterate all chunks
-  for (i in 1:(length(rowindices)-1)) {
-    chunk <- datadf[ (rowindices[i]):(rowindices[i+1]-1), ]
-    
-    main_unit <- chunk$Bezeichnung[[1]]
-    chunk <- chunk[-1,]
-    chunk %<>% filter(is.na(Anzahl) | Anzahl > 0)
-    
-    # If "Nr." column contains additional strings, we use a slightly different formatting
-    # Note: this code could be compressed significantly by forcing two more columns for long-formatting & grouping
-    if (F %in% is.na(chunk$`Nr.`)) {
-      sub_idx <- c(1, which(is.na(chunk$Bezeichnung)), nrow(chunk)) %>% unique()
-      first <- T
-      
-      for(j in 1:(length(sub_idx)-1)) {
-        sub_chunk <- chunk[ sub_idx[j]:(sub_idx[j+1]-1), ] %>% drop_na(Bezeichnung)
-        sub_unit <- sub_chunk[, 1 ] %>% 
-          drop_na() %>%
-          .[["Nr."]] %>%
-          rev %>%
-          paste(collapse = " ")
-        
-        # if the string is empty, print a new header only if it is the first entry of this chunk
-        if (first || sub_unit != "") {
-          # print header
-          first <- F
-          output_lines <- c(output_lines, paste(main_unit, sub_unit) %>% trimws %>% paste0(":"))
-        } else {
-          output_lines <- c(output_lines, "")
-        }
-        
-        if (!add_prices)
-          s <- sprintf("%i Stk %s\n  Fabrikat: %s\n  Typ: %s\n", sub_chunk$Anzahl, sub_chunk$Bezeichnung, sub_chunk$Hersteller, sub_chunk$Typ) %>% str_split("\n") %>% unlist
-        else
-          s <- sprintf("%i Stk %s\n  Fabrikat: %s\n  Typ: %s\n  EP: %.2fâ‚¬\n", sub_chunk$Anzahl, sub_chunk$Bezeichnung, sub_chunk$Hersteller, sub_chunk$Typ, sub_chunk[["VK\r\nEP"]]) %>% str_split("\n") %>% unlist
-        output_lines <- c(output_lines, s)
-      }
-  
+  for (ir in 1:nrow(datadf)) {
+    # A cell can either be:
+    #  A title
+    #  An item
+    #  A blank cell
+    cell <- datadf[ir,]
+    if ( cell %$% { !is.na(Bezeichnung) & is.na(Typ) & is.na(Hersteller)} ) {
+      output_lines <- c(output_lines, sprintf("%s:", cell$Bezeichnung))
+    } else if ( !is.na(cell$Bezeichnung) ) {
+      output_lines <- c(output_lines, sprintf("%i Stk %s\n  Fabrikat: %s", cell$Anzahl, cell$Bezeichnung, cell$Hersteller)) %>%
+        str_split("\n") %>%
+        unlist
+      if (!is.na(cell$Typ))
+        output_lines <- c(output_lines, sprintf("  Typ: %s", cell$Typ))
+      if (add_prices)
+        output_lines <- c(output_lines, sprintf("  EP: %s", cell[[ep_col]]))
     } else {
-      chunk %<>% drop_na(Bezeichnung)
-      output_lines <- c(output_lines, paste0(main_unit, ":"))
-      if (!add_prices)
-        s <- sprintf("%i Stk %s\n  Fabrikat: %s\n  Typ: %s\n", chunk$Anzahl, chunk$Bezeichnung, chunk$Hersteller, chunk$Typ) %>% str_split("\n") %>% unlist
-      else
-        s <- sprintf("%i Stk %s\n  Fabrikat: %s\n  Typ: %s\n  EP: %.2fâ‚¬\n", chunk$Anzahl, chunk$Bezeichnung, chunk$Hersteller, chunk$Typ, chunk[["VK\r\nEP"]]) %>% str_split("\n") %>% unlist
-      output_lines <- c(output_lines, s)
+      output_lines <- c(output_lines, "")
     }
   }
   
-  output_lines %<>% unlist
+  output_lines %<>% unlist %>% str_remove_all("\\r")
   output_file <- paste0(output_pref, ".", sheet, ".txt")
   message("  >> Writing output to: ", output_file)
   writeLines(output_lines, output_file)
